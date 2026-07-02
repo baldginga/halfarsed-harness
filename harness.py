@@ -244,10 +244,20 @@ def main():
     check_common_paths(base_url, results)
     check_error_verbosity(base_url, results)
 
-    with open("report.json", "w") as f:
+    # --- Generate a unique filename ---
+    # Extract a clean identifier from the hostname (e.g., "www_dpmc_govt_nz")
+    clean_identifier = hostname.replace(".", "_") if hostname else "unknown_target"
+    
+    # Format the current time for a filename (e.g., "20260702_102523")
+    time_str = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    
+    filename = f"report_{clean_identifier}_{time_str}.json"
+    
+    # Write the report to the unique filename
+    with open(filename, "w") as f:
         json.dump(results, f, indent=2, default=str)
-
-    print("\n[*] Full report written to report.json")
+        
+    print(f"\n[*] Full report written to {filename}")
     print("[*] This harness covers infra/config checks only.")
     print("[*] Run manual_test_cases.md for the XSS / prompt-injection / rate-limit checks")
     print("[*] that need a human to actually submit the form and look at the result.")
