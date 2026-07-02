@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """
 Security testing harness for self-owned websites.
-Target: https://transparent-ai-demo.vercel.app/ (or pass --url)
 
 Scope note: run this ONLY against sites you own/control. This script does
 non-destructive checks only: HTTP requests to your own endpoints and
@@ -10,7 +9,11 @@ or automated attack against third parties.
 
 Usage:
     pip install requests
-    python3 harness.py --url https://transparent-ai-demo.vercel.app/
+    python harness.py
+    (it will ask which URL to test)
+
+    -- or skip the prompt --
+    python harness.py --url https://example.com/
 
 Output: a report printed to stdout, and saved to report.json
 """
@@ -203,13 +206,35 @@ def check_error_verbosity(base_url, results):
     results["error_verbosity"] = tests
 
 
-def main():
+def get_target_url():
+    """Ask the user which site to test, either via --url flag or interactively."""
     ap = argparse.ArgumentParser()
-    ap.add_argument("--url", default="https://transparent-ai-demo.vercel.app/")
+    ap.add_argument("--url", default=None, help="Site to test, e.g. https://example.com/")
     args = ap.parse_args()
 
-    base_url = args.url if args.url.endswith("/") else args.url + "/"
+    if args.url:
+        raw = args.url
+    else:
+        raw = input("Which website do you want to test? (e.g. https://example.com/): ").strip()
+        while not raw:
+            raw = input("Please enter a URL: ").strip()
+
+    if not raw.startswith("http://") and not raw.startswith("https://"):
+        raw = "https://" + raw  # assume https if they just typed "example.com"
+
+    return raw
+
+
+def main():
+    base_url = get_target_url()
+    base_url = base_url if base_url.endswith("/") else base_url + "/"
     hostname = urlparse(base_url).hostname
+
+    print(f"\n[*] Target set to: {base_url}")
+    confirm = input("Proceed with scan? This should be a site YOU own/control. (y/n): ").strip().lower()
+    if confirm != "y":
+        print("Aborted.")
+        sys.exit(0)
 
     results = {"target": base_url, "run_at": now()}
 
