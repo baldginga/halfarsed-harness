@@ -242,7 +242,7 @@ def main():
         
         if confirm != "y":
             print("Aborted.")
-            return  # Using return instead of sys.exit(0) keeps us inside our try/finally block
+            return
 
         results = {"target": base_url, "run_at": now()}
 
@@ -252,7 +252,7 @@ def main():
         check_common_paths(base_url, results)
         check_error_verbosity(base_url, results)
 
-       # --- Generate a unique filename ---
+        # --- Generate a unique filename ---
         clean_identifier = hostname.replace(".", "_") if hostname else "unknown_target"
         time_str = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
         filename = f"report_{clean_identifier}_{time_str}.json"
