@@ -287,7 +287,7 @@ def main():
         with open(full_path, "w") as f:
             json.dump(results, f, indent=2, default=str)
 
-        print(f"\n[*] Full report written to {full_path}")
+        print(f"\n[*] Full report written to {G:\richa\Documents\AI projects\halfarsed harness}")
 
     print("[*] This harness covers infra/config checks only.")
     print("[*] Run manual_test_cases.md for the XSS / prompt-injection / rate-limit checks")
