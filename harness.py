@@ -275,16 +275,19 @@ def main():
         input("Process finished. Press ENTER to close this window...")
 
 # --- Generate a unique filename ---
-    clean_identifier = hostname.replace(".", "_") if hostname else "unknown_target"
-    time_str = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-    
-    # This must use the variable name without quotes inside the open() function
-    filename = f"report_{clean_identifier}_{time_str}.json"
-    
-    with open(filename, "w") as f:
-        json.dump(results, f, indent=2, default=str)
+        clean_identifier = hostname.replace(".", "_") if hostname else "unknown_target"
+        time_str = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+        filename = f"report_{clean_identifier}_{time_str}.json"
         
-    print(f"\n[*] Full report written to {filename}")
+        # FIX: Force the file to save in the script's actual folder
+        import os
+        script_dir = sys.path[0] if sys.path[0] else os.getcwd()
+        full_path = os.path.join(script_dir, filename)
+
+        with open(full_path, "w") as f:
+            json.dump(results, f, indent=2, default=str)
+
+        print(f"\n[*] Full report written to {full_path}")
 
     print("[*] This harness covers infra/config checks only.")
     print("[*] Run manual_test_cases.md for the XSS / prompt-injection / rate-limit checks")
