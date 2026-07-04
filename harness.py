@@ -30,12 +30,88 @@ from urllib.parse import urljoin, urlparse
 try:
     import requests
 except ImportError:
-    import subprocess
-    print("[*] 'requests' library missing. Attempting to auto-install...")
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "requests"])
-    import requests
+    print("[!] 'requests' library is missing.")
+    print("    Auto-install has been disabled deliberately: when you suspect a host")
+    print("    is compromised, this environment shouldn't be silently pulling and")
+    print("    executing code from the network on your behalf.")
+    print("    Install it yourself first:  pip install requests")
+    sys.exit(1)
 
 TIMEOUT = 10
+
+# --- Safety limits (relevant when scanning a possibly-compromised host) ----
+MAX_RESPONSE_BYTES = 5 * 1024 * 1024   # 5 MB cap; refuse to buffer more
+MAX_REDIRECTS = 3
+CONNECT_TIMEOUT = 6
+READ_TIMEOUT = 10
+REQUEST_TIMEOUT = (CONNECT_TIMEOUT, READ_TIMEOUT)
+
+
+def strip_terminal_escapes(text):
+    """
+    Remove ANSI/terminal escape sequences before printing anything that came
+    from a remote response. A malicious/compromised server could otherwise
+    inject escape codes to manipulate your terminal.
+    """
+    import re
+    if not isinstance(text, str):
+        return text
+    text = re.sub(r'\x1b\[[0-9;]*[a-zA-Z]', '', text)
+    text = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', text)
+    return text
+
+
+def safe_get(url, **kwargs):
+    """
+    Wrapper around requests.get that:
+      - never follows redirects automatically (so hops can be inspected/validated)
+      - caps how much of the body is ever buffered into memory
+      - uses separate connect/read timeouts
+    """
+    kwargs.pop("allow_redirects", None)
+    kwargs.setdefault("timeout", REQUEST_TIMEOUT)
+    kwargs["allow_redirects"] = False
+    kwargs["stream"] = True
+    r = requests.get(url, **kwargs)
+    content = b""
+    for chunk in r.iter_content(chunk_size=8192):
+        content += chunk
+        if len(content) > MAX_RESPONSE_BYTES:
+            r.close()
+            raise ValueError(f"Response exceeded {MAX_RESPONSE_BYTES} byte safety cap "
+                              f"while fetching {url} — aborted before fully buffering.")
+    r._content = content  # let existing code keep using r.text / r.content
+    return r
+
+
+def follow_redirects_in_scope(base_url, url, max_hops=MAX_REDIRECTS, results=None):
+    """
+    Manually follow redirects with a hop cap, flagging any hop that leaves the
+    original domain — a common sign of a compromised host quietly redirecting
+    visitors elsewhere (malvertising, phishing kits, etc).
+    """
+    original_host = urlparse(base_url).hostname
+    current = url
+    hops = []
+    r = None
+    for _ in range(max_hops + 1):
+        r = safe_get(current)
+        hop = {"url": current, "status": r.status_code}
+        hops.append(hop)
+        if r.status_code in (301, 302, 303, 307, 308) and "Location" in r.headers:
+            nxt = urljoin(current, r.headers["Location"])
+            nxt_host = urlparse(nxt).hostname
+            if nxt_host != original_host:
+                hop["FLAG"] = f"Redirects OFF-DOMAIN to {nxt_host} — verify this is intentional."
+                print(f"    [FLAG] Redirect leaves original domain: {current} -> {nxt}")
+            current = nxt
+            continue
+        break
+    else:
+        hops.append({"note": f"Stopped after {max_hops} redirects (possible loop or off-scope chain)."})
+    if results is not None:
+        results.setdefault("redirect_chain", []).extend(hops)
+    return r
 
 # --- Security header expectations -----------------------------------------
 EXPECTED_HEADERS = {
@@ -81,8 +157,8 @@ def now():
 def check_headers(base_url, results):
     print(f"\n[*] Checking security headers on {base_url}")
     try:
-        r = requests.get(base_url, timeout=TIMEOUT, allow_redirects=True)
-    except requests.RequestException as e:
+        r = follow_redirects_in_scope(base_url, base_url, results=results)
+    except (requests.RequestException, ValueError) as e:
         results["headers"] = {"error": str(e)}
         print(f"    ERROR: {e}")
         return
@@ -111,6 +187,26 @@ def check_headers(base_url, results):
             print(f"      - {m['header']}: {m['why_it_matters']}")
     else:
         print("    All checked headers present.")
+
+
+def check_dns(hostname, results):
+    """
+    Log the currently-resolved IP(s) for the target. Useful as a tamper-evident
+    record: if you're worried about compromise (e.g. DNS hijacking, a rogue
+    A/CNAME record pointing traffic elsewhere), comparing this across scans
+    or against your DNS provider's dashboard is a cheap sanity check.
+    """
+    print(f"\n[*] Resolving DNS for {hostname}")
+    try:
+        infos = socket.getaddrinfo(hostname, 443)
+        ips = sorted(set(info[4][0] for info in infos))
+        results["dns"] = {"hostname": hostname, "resolved_ips": ips}
+        print(f"    Resolved IP(s): {', '.join(ips)}")
+        print("    Cross-check these against your host/registrar/DNS provider's")
+        print("    dashboard if you suspect DNS hijacking.")
+    except socket.gaierror as e:
+        results["dns"] = {"error": str(e)}
+        print(f"    ERROR: {e}")
 
 
 def check_tls(hostname, results, port=443):
@@ -144,7 +240,7 @@ def check_cors(base_url, results):
     print(f"\n[*] Checking CORS behavior on {base_url}")
     test_origin = "https://evil-example-test.invalid"
     try:
-        r = requests.get(base_url, headers={"Origin": test_origin}, timeout=TIMEOUT)
+        r = safe_get(base_url, headers={"Origin": test_origin})
         acao = r.headers.get("Access-Control-Allow-Origin")
         acac = r.headers.get("Access-Control-Allow-Credentials")
         finding = None
@@ -160,7 +256,7 @@ def check_cors(base_url, results):
         print(f"    ACAO: {acao}, ACAC: {acac}")
         if finding:
             print(f"    FINDING: {finding}")
-    except requests.RequestException as e:
+    except (requests.RequestException, ValueError) as e:
         results["cors"] = {"error": str(e)}
         print(f"    ERROR: {e}")
 
@@ -171,20 +267,22 @@ def check_common_paths(base_url, results):
     for path in COMMON_PATHS:
         url = urljoin(base_url, path)
         try:
-            r = requests.get(url, timeout=TIMEOUT, allow_redirects=False)
+            r = safe_get(url)
             status = r.status_code
             size = len(r.content)
             entry = {"path": path, "status": status, "size": size}
             if status == 200 and path in SENSITIVE_PATHS and size > 0:
                 entry["SEVERITY"] = "HIGH — sensitive file appears to be publicly served"
                 print(f"    [HIGH] {path} -> {status} ({size} bytes) — investigate manually")
+                print("           Do NOT open this file in a browser. View it as plain text only")
+                print("           (e.g. `less` / a text editor) — never execute or import it.")
             elif status == 200:
                 print(f"    [info] {path} -> 200 ({size} bytes)")
             else:
                 print(f"    [ok]   {path} -> {status}")
             findings.append(entry)
-        except requests.RequestException as e:
-            findings.append({"path": path, "error": str(e)})
+        except (requests.RequestException, ValueError) as e:
+            findings.append({"path": path, "error": strip_terminal_escapes(str(e))})
         time.sleep(0.2)  # be gentle, don't hammer your own host
     results["path_probe"] = findings
 
@@ -195,8 +293,15 @@ def check_error_verbosity(base_url, results):
     tests = []
     api_guess = urljoin(base_url, "api/assess")
     try:
-        r = requests.post(api_guess, json={"malformed": True}, timeout=TIMEOUT)
-        leaks_stack = any(kw in r.text.lower() for kw in ["traceback", "at node:", "stack:", "internal server error", "prisma", "env.", "api_key"])
+        r = requests.post(
+            api_guess,
+            json={"malformed": True},
+            timeout=REQUEST_TIMEOUT,
+            allow_redirects=False,  # don't silently POST to wherever a redirect points
+        )
+        # Cap how much of the body we scan/store, same rationale as safe_get.
+        body = r.text[:MAX_RESPONSE_BYTES]
+        leaks_stack = any(kw in body.lower() for kw in ["traceback", "at node:", "stack:", "internal server error", "prisma", "env.", "api_key"])
         tests.append({
             "endpoint_guessed": api_guess,
             "status": r.status_code,
@@ -205,10 +310,11 @@ def check_error_verbosity(base_url, results):
         })
         if leaks_stack:
             print(f"    [WARN] Response body may contain internal details — review manually: {api_guess}")
+            print("           Review the saved JSON report in a text editor, not a browser.")
         else:
             print(f"    [ok] No obvious leak markers on {api_guess} (status {r.status_code})")
     except requests.RequestException as e:
-        tests.append({"endpoint_guessed": api_guess, "error": str(e)})
+        tests.append({"endpoint_guessed": api_guess, "error": strip_terminal_escapes(str(e))})
     results["error_verbosity"] = tests
 
 
@@ -246,6 +352,7 @@ def main():
 
         results = {"target": base_url, "run_at": now()}
 
+        check_dns(hostname, results)
         check_headers(base_url, results)
         check_tls(hostname, results)
         check_cors(base_url, results)
