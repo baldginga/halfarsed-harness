@@ -154,6 +154,88 @@ def now():
     return datetime.now(timezone.utc).isoformat()
 
 
+def _parse_set_cookie(raw_cookie):
+    """
+    Parse a single raw Set-Cookie header string into name + flags.
+    Doesn't use http.cookiejar because it normalizes away the exact
+    HttpOnly/SameSite casing/values we want to report on.
+    """
+    parts = [p.strip() for p in raw_cookie.split(";")]
+    name = parts[0].split("=", 1)[0] if parts else "(unknown)"
+    attrs = {p.split("=", 1)[0].strip().lower(): (p.split("=", 1)[1].strip() if "=" in p else True)
+              for p in parts[1:]}
+    return {
+        "name": name,
+        "secure": "secure" in attrs,
+        "httponly": "httponly" in attrs,
+        "samesite": attrs.get("samesite"),
+        "raw": raw_cookie,
+    }
+
+
+def check_cookies(base_url, results):
+    """
+    Inspect Set-Cookie headers for the Secure, HttpOnly, and SameSite flags.
+
+    Why this matters:
+      - Missing HttpOnly: client-side JS (including any injected via XSS) can
+        read the cookie and exfiltrate it — turns a minor XSS into full
+        session theft.
+      - Missing Secure: the cookie can be sent over plain HTTP, exposing it
+        to network-level interception.
+      - Missing/weak SameSite: opens the door to CSRF; SameSite=None without
+        Secure is invalid and rejected by modern browsers anyway, but is
+        still worth flagging as a misconfiguration.
+    """
+    print(f"\n[*] Checking cookie flags on {base_url}")
+    try:
+        r = safe_get(base_url)
+    except (requests.RequestException, ValueError) as e:
+        results["cookies"] = {"error": str(e)}
+        print(f"    ERROR: {e}")
+        return
+
+    # requests merges multiple Set-Cookie headers into one comma-joined
+    # string on r.headers, which breaks parsing (cookie values/Expires can
+    # contain commas). Pull the raw, unmerged list instead when available.
+    raw_cookies = []
+    try:
+        raw_cookies = list(r.raw.headers.getlist("Set-Cookie"))
+    except AttributeError:
+        single = r.headers.get("Set-Cookie")
+        if single:
+            raw_cookies = [single]
+
+    if not raw_cookies:
+        results["cookies"] = {"count": 0, "note": "No Set-Cookie headers observed on this response."}
+        print("    No cookies set on this response (may still be set elsewhere, e.g. after login).")
+        return
+
+    findings = []
+    for raw in raw_cookies:
+        parsed = _parse_set_cookie(raw)
+        issues = []
+        if not parsed["secure"]:
+            issues.append("missing Secure — cookie can be sent over plain HTTP")
+        if not parsed["httponly"]:
+            issues.append("missing HttpOnly — readable by JavaScript, including injected XSS")
+        samesite = (parsed["samesite"] or "").lower()
+        if not samesite:
+            issues.append("missing SameSite — defaults vary by browser, don't rely on it")
+        elif samesite == "none" and not parsed["secure"]:
+            issues.append("SameSite=None without Secure — invalid combination, browsers will reject this cookie")
+        parsed["issues"] = issues
+        findings.append(parsed)
+
+        label = "HIGH" if issues else "ok"
+        print(f"    [{label}] {parsed['name']}: Secure={parsed['secure']} "
+              f"HttpOnly={parsed['httponly']} SameSite={parsed['samesite']}")
+        for issue in issues:
+            print(f"           - {issue}")
+
+    results["cookies"] = {"count": len(findings), "cookies": findings}
+
+
 def check_headers(base_url, results):
     print(f"\n[*] Checking security headers on {base_url}")
     try:
@@ -354,6 +436,7 @@ def main():
 
         check_dns(hostname, results)
         check_headers(base_url, results)
+        check_cookies(base_url, results)
         check_tls(hostname, results)
         check_cors(base_url, results)
         check_common_paths(base_url, results)
