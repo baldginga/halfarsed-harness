@@ -84,11 +84,15 @@ def safe_get(url, **kwargs):
     return r
 
 
-def follow_redirects_in_scope(base_url, url, max_hops=MAX_REDIRECTS, results=None):
+def follow_redirects_in_scope(base_url, url, max_hops=MAX_REDIRECTS, results=None, chain_key="redirect_chain"):
     """
     Manually follow redirects with a hop cap, flagging any hop that leaves the
     original domain — a common sign of a compromised host quietly redirecting
     visitors elsewhere (malvertising, phishing kits, etc).
+
+    chain_key lets separate scan passes (e.g. HTTPS vs HTTP downgrade) record
+    their redirect chains under distinct result keys instead of clobbering
+    each other.
     """
     original_host = urlparse(base_url).hostname
     current = url
@@ -110,7 +114,7 @@ def follow_redirects_in_scope(base_url, url, max_hops=MAX_REDIRECTS, results=Non
     else:
         hops.append({"note": f"Stopped after {max_hops} redirects (possible loop or off-scope chain)."})
     if results is not None:
-        results.setdefault("redirect_chain", []).extend(hops)
+        results.setdefault(chain_key, []).extend(hops)
     return r
 
 # --- Security header expectations -----------------------------------------
@@ -236,10 +240,75 @@ def check_cookies(base_url, results):
     results["cookies"] = {"count": len(findings), "cookies": findings}
 
 
+def check_http_downgrade(hostname, https_results, results):
+    """
+    Explicitly probe the plain-HTTP version of the site and verify it does
+    nothing but redirect cleanly to HTTPS.
+
+    This is a distinct check from the main HTTPS scan, run second and on
+    purpose — not because HTTP is untrusted by default, but because:
+      - If HTTP serves real content (200, non-empty body) instead of
+        redirecting, that content is being sent unencrypted and is
+        trivially interceptable/modifiable in transit (classic MITM target).
+      - If HTTP's final content differs from the HTTPS page's content, that's
+        a strong signal something is injecting/serving different content
+        depending on scheme — worth investigating as a possible compromise,
+        not just a config oversight.
+      - If HTTP redirects off-domain, follow_redirects_in_scope already
+        flags that.
+    """
+    http_url = f"http://{hostname}/"
+    print(f"\n[*] Checking HTTP -> HTTPS downgrade behavior on {http_url}")
+    try:
+        r = follow_redirects_in_scope(http_url, http_url, results=results, chain_key="redirect_chain_http")
+    except (requests.RequestException, ValueError) as e:
+        results["http_downgrade"] = {"error": str(e)}
+        print(f"    ERROR: {e}")
+        return
+
+    chain = results.get("redirect_chain_http", [])
+    first_hop = chain[0] if chain else {}
+    first_hop_status = first_hop.get("status")
+    final_scheme = urlparse(r.url if hasattr(r, "url") else http_url).scheme
+    ended_on_https = final_scheme == "https" or any(
+        urlparse(hop.get("url", "")).scheme == "https" for hop in chain[1:]
+    )
+
+    entry = {
+        "first_hop_status": first_hop_status,
+        "final_status": r.status_code,
+        # Plaintext exposure means the very first plain-HTTP request itself
+        # returned 200 (served content directly) instead of redirecting.
+        "served_over_plaintext": first_hop_status == 200,
+    }
+
+    if entry["served_over_plaintext"]:
+        entry["SEVERITY"] = "HIGH — HTTP serves real content instead of redirecting to HTTPS"
+        print("    [HIGH] Plain HTTP returned a real 200 response instead of redirecting.")
+        print("           Content sent this way is unencrypted and interceptable/modifiable in transit.")
+    elif not ended_on_https and r.status_code not in (301, 302, 303, 307, 308):
+        entry["note"] = "HTTP did not redirect and did not return a normal 200 either — investigate manually."
+        print(f"    [WARN] Unexpected status from plain HTTP: {r.status_code}")
+    else:
+        # Compare against the HTTPS homepage content, if we have it, to catch
+        # divergent content served depending on scheme.
+        https_body = https_results.get("_homepage_body")
+        if https_body is not None and r.content:
+            if r.content != https_body and len(r.content) > 0:
+                entry["content_diverges_from_https"] = True
+                entry["SEVERITY"] = "MEDIUM — HTTP body differs from HTTPS body before redirect completes"
+                print("    [WARN] Content served on the initial HTTP hop differs from the HTTPS page.")
+            else:
+                entry["content_diverges_from_https"] = False
+        print(f"    [ok] HTTP redirects to HTTPS as expected (final status {r.status_code}).")
+
+    results["http_downgrade"] = entry
+
+
 def check_headers(base_url, results):
     print(f"\n[*] Checking security headers on {base_url}")
     try:
-        r = follow_redirects_in_scope(base_url, base_url, results=results)
+        r = follow_redirects_in_scope(base_url, base_url, results=results, chain_key="redirect_chain_https")
     except (requests.RequestException, ValueError) as e:
         results["headers"] = {"error": str(e)}
         print(f"    ERROR: {e}")
@@ -261,6 +330,7 @@ def check_headers(base_url, results):
         "present_security_headers": present,
         "missing_security_headers": missing,
     }
+    results["_homepage_body"] = r.content  # stashed for HTTP-vs-HTTPS content comparison
 
     print(f"    Status: {r.status_code}")
     if missing:
@@ -421,26 +491,42 @@ def get_target_url():
 
 def main():
     try:
-        base_url = get_target_url()
-        base_url = base_url if base_url.endswith("/") else base_url + "/"
-        hostname = urlparse(base_url).hostname
+        raw_url = get_target_url()
+        hostname = urlparse(raw_url if "://" in raw_url else "https://" + raw_url).hostname
+        if not hostname:
+            print(f"[CRITICAL ERROR] Could not parse a hostname out of: {raw_url}")
+            return
 
-        print(f"\n[*] Target set to: {base_url}")
+        # Always run the deep scan against HTTPS, regardless of what scheme the
+        # user typed — HTTPS is the canonical, trusted-transport version of the
+        # site and is what path/cookie/CORS findings should reflect. Plain HTTP
+        # is checked afterward, deliberately, as a narrower downgrade check.
+        https_url = f"https://{hostname}/"
+
+        print(f"\n[*] Canonical HTTPS target: {https_url}")
+        print(f"[*] Will also check plain-HTTP downgrade behavior for: http://{hostname}/")
         confirm = input("Proceed with scan? This should be a site YOU own/control. (y/n): ").strip().lower()
-        
+
         if confirm != "y":
             print("Aborted.")
             return
 
-        results = {"target": base_url, "run_at": now()}
+        results = {"target": https_url, "run_at": now()}
 
+        # --- Pass 1: HTTPS (canonical, deep scan) ---
         check_dns(hostname, results)
-        check_headers(base_url, results)
-        check_cookies(base_url, results)
+        check_headers(https_url, results)
+        check_cookies(https_url, results)
         check_tls(hostname, results)
-        check_cors(base_url, results)
-        check_common_paths(base_url, results)
-        check_error_verbosity(base_url, results)
+        check_cors(https_url, results)
+        check_common_paths(https_url, results)
+        check_error_verbosity(https_url, results)
+
+        # --- Pass 2: HTTP (downgrade / plaintext-exposure check only) ---
+        check_http_downgrade(hostname, results, results)
+
+        # Strip internal-only scratch data before writing the report.
+        results.pop("_homepage_body", None)
 
         # --- Generate a unique filename ---
         clean_identifier = hostname.replace(".", "_") if hostname else "unknown_target"
