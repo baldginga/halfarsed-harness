@@ -287,11 +287,18 @@ def main():
         with open(full_path, "w") as f:
             json.dump(results, f, indent=2, default=str)
 
-        print(f"\n[*] Full report written to {G:\richa\Documents\AI projects\halfarsed harness}")
+        print(f"\n[*] Full report written to: {full_path}")
+        print("[*] This harness covers infra/config checks only.")
+        print("[*] Run manual_test_cases.md for the XSS / prompt-injection / rate-limit checks")
+        print("[*] that need a human to actually submit the form and look at the result.")
 
-    print("[*] This harness covers infra/config checks only.")
-    print("[*] Run manual_test_cases.md for the XSS / prompt-injection / rate-limit checks")
-    print("[*] that need a human to actually submit the form and look at the result.")
+    except Exception as e:
+        print(f"\n[CRITICAL ERROR] The script crashed: {e}")
+        
+    finally:
+        # This forces the PowerShell/CMD window to stay open no matter what
+        print("\n" + "="*40)
+        input("Process finished. Press ENTER to close this window...")
 
 
 if __name__ == "__main__":
