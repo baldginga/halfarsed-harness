@@ -27,7 +27,13 @@ import time
 from datetime import datetime, timezone
 from urllib.parse import urljoin, urlparse
 
-import requests
+try:
+    import requests
+except ImportError:
+    import subprocess
+    print("[*] 'requests' library missing. Attempting to auto-install...")
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "requests"])
+    import requests
 
 TIMEOUT = 10
 
@@ -226,23 +232,47 @@ def get_target_url():
 
 
 def main():
-    base_url = get_target_url()
-    base_url = base_url if base_url.endswith("/") else base_url + "/"
-    hostname = urlparse(base_url).hostname
+    try:
+        base_url = get_target_url()
+        base_url = base_url if base_url.endswith("/") else base_url + "/"
+        hostname = urlparse(base_url).hostname
 
-    print(f"\n[*] Target set to: {base_url}")
-    confirm = input("Proceed with scan? This should be a site YOU own/control. (y/n): ").strip().lower()
-    if confirm != "y":
-        print("Aborted.")
-        sys.exit(0)
+        print(f"\n[*] Target set to: {base_url}")
+        confirm = input("Proceed with scan? This should be a site YOU own/control. (y/n): ").strip().lower()
+        
+        if confirm != "y":
+            print("Aborted.")
+            return  # Using return instead of sys.exit(0) keeps us inside our try/finally block
 
-    results = {"target": base_url, "run_at": now()}
+        results = {"target": base_url, "run_at": now()}
 
-    check_headers(base_url, results)
-    check_tls(hostname, results)
-    check_cors(base_url, results)
-    check_common_paths(base_url, results)
-    check_error_verbosity(base_url, results)
+        check_headers(base_url, results)
+        check_tls(hostname, results)
+        check_cors(base_url, results)
+        check_common_paths(base_url, results)
+        check_error_verbosity(base_url, results)
+
+        # --- Generate a unique filename ---
+        clean_identifier = hostname.replace(".", "_") if hostname else "unknown_target"
+        time_str = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+        
+        filename = f"report_{clean_identifier}_{time_str}.json"
+        
+        with open(filename, "w") as f:
+            json.dump(results, f, indent=2, default=str)
+
+        print(f"\n[*] Full report written to {filename}")
+        print("[*] This harness covers infra/config checks only.")
+        print("[*] Run manual_test_cases.md for the XSS / prompt-injection / rate-limit checks")
+        print("[*] that need a human to actually submit the form and look at the result.")
+
+    except Exception as e:
+        print(f"\n[CRITICAL ERROR] The script crashed: {e}")
+        
+    finally:
+        # This forces the PowerShell/CMD window to stay open no matter what
+        print("\n" + "="*40)
+        input("Process finished. Press ENTER to close this window...")
 
 # --- Generate a unique filename ---
     clean_identifier = hostname.replace(".", "_") if hostname else "unknown_target"
