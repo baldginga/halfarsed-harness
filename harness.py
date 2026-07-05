@@ -134,24 +134,108 @@ COMMON_PATHS = [
     "robots.txt",
     "sitemap.xml",
     ".well-known/security.txt",
+
+    # --- Env / secrets / VCS exposure ---
     ".env",
     ".env.local",
     ".env.production",
+    ".env.backup",
     ".git/config",
     ".git/HEAD",
+    ".svn/entries",
+    ".hg/store",
+
+    # --- Backup / dump file patterns (common compromise + misconfig artifact) ---
+    # Attackers who get shell access often leave these behind, and admins
+    # sometimes leave them from manual backups before a deploy.
+    "backup.zip",
+    "backup.tar.gz",
+    "backup.sql",
+    "backup.sql.gz",
+    "db.sql",
+    "database.sql",
+    "dump.sql",
+    "site-backup.zip",
+    "www.zip",
+    "www.tar.gz",
+    "site.tar.gz",
+    "backup.old",
+    "old.zip",
+
+    # --- Generic app config / build files ---
     "package.json",
+    "composer.json",
+    "composer.lock",
+    "config.php",
+    "config.php.bak",
+    "configuration.php",  # Joomla
+    "settings.py",        # Django
+    "database.yml",       # Rails
+    "web.config",         # ASP.NET
+    "appsettings.json",   # ASP.NET Core
+    "credentials.json",
+    "secrets.yml",
+    "id_rsa",
+    ".ssh/id_rsa",
+
+    # --- Next.js specific ---
     "next.config.js",
     "next.config.mjs",
     "_next/static/chunks/webpack.js",  # existence implies build layout is guessable
+    "_next/static/",
+    ".next/build-manifest.json",
     "api/",
     "api/health",
     "api/assess",  # guess based on form purpose - adjust to real routes if known
     "vercel.json",
     ".vercel/project.json",
+
+    # --- WordPress specific (extremely common target regardless of your stack,
+    # since attackers often scan indiscriminately for it) ---
+    "wp-login.php",
+    "wp-admin/",
+    "wp-content/",
+    "wp-content/debug.log",
+    "wp-config.php",
+    "wp-config.php.bak",
+    "wp-config.php.save",
+    "wp-json/wp/v2/users",  # user enumeration if this responds with real data
+
+    # --- Other common admin panels worth a quick check regardless of stack ---
+    "admin/",
+    "administrator/",
+    "phpmyadmin/",
+    ".DS_Store",
+
+    # --- Common webshell / backdoor filenames — presence of ANY of these
+    # returning 200 is a strong compromise indicator, not just a misconfig ---
+    "shell.php",
+    "cmd.php",
+    "webshell.php",
+    "c99.php",
+    "r57.php",
+    "adminer.php",
 ]
 
 # Paths that, if they return 200 with real content, are meaningful findings
-SENSITIVE_PATHS = {".env", ".env.local", ".env.production", ".git/config", ".git/HEAD", "vercel.json", ".vercel/project.json"}
+SENSITIVE_PATHS = {
+    ".env", ".env.local", ".env.production", ".env.backup",
+    ".git/config", ".git/HEAD", ".svn/entries", ".hg/store",
+    "backup.zip", "backup.tar.gz", "backup.sql", "backup.sql.gz",
+    "db.sql", "database.sql", "dump.sql", "site-backup.zip",
+    "www.zip", "www.tar.gz", "site.tar.gz", "backup.old", "old.zip",
+    "config.php", "config.php.bak", "configuration.php", "settings.py",
+    "database.yml", "web.config", "appsettings.json", "credentials.json",
+    "secrets.yml", "id_rsa", ".ssh/id_rsa",
+    "vercel.json", ".vercel/project.json", ".next/build-manifest.json",
+    "wp-config.php", "wp-config.php.bak", "wp-config.php.save",
+    "wp-content/debug.log", "wp-json/wp/v2/users",
+}
+
+# Presence of any of these (200 with content) is treated as CRITICAL, not just
+# HIGH — these filenames are backdoor/webshell conventions, not legitimate
+# app files that would ever be intentionally publicly served.
+WEBSHELL_PATHS = {"shell.php", "cmd.php", "webshell.php", "c99.php", "r57.php", "adminer.php"}
 
 
 def now():
@@ -569,6 +653,7 @@ def check_cors(base_url, results):
 
 def check_common_paths(base_url, results):
     print(f"\n[*] Probing common paths for exposure/misconfig")
+    import hashlib
     findings = []
     for path in COMMON_PATHS:
         url = urljoin(base_url, path)
@@ -577,7 +662,19 @@ def check_common_paths(base_url, results):
             status = r.status_code
             size = len(r.content)
             entry = {"path": path, "status": status, "size": size}
-            if status == 200 and path in SENSITIVE_PATHS and size > 0:
+            if status == 200 and size > 0:
+                # Stash a content hash so a later run can diff against a saved
+                # baseline and flag drift (new/changed public files over time),
+                # not just point-in-time findings.
+                entry["sha256"] = hashlib.sha256(r.content).hexdigest()
+
+            if status == 200 and path in WEBSHELL_PATHS and size > 0:
+                entry["SEVERITY"] = "CRITICAL — this filename matches common webshell/backdoor naming conventions"
+                print(f"    [CRITICAL] {path} -> {status} ({size} bytes) — this is not a normal app file.")
+                print("               Treat this as a likely compromise indicator. Do NOT open it in a")
+                print("               browser or execute it. Preserve it for forensic review, rotate")
+                print("               credentials, and consider taking the host offline pending investigation.")
+            elif status == 200 and path in SENSITIVE_PATHS and size > 0:
                 entry["SEVERITY"] = "HIGH — sensitive file appears to be publicly served"
                 print(f"    [HIGH] {path} -> {status} ({size} bytes) — investigate manually")
                 print("           Do NOT open this file in a browser. View it as plain text only")
@@ -591,6 +688,101 @@ def check_common_paths(base_url, results):
             findings.append({"path": path, "error": strip_terminal_escapes(str(e))})
         time.sleep(0.2)  # be gentle, don't hammer your own host
     results["path_probe"] = findings
+
+
+def get_script_dir():
+    import os
+    return sys.path[0] if sys.path[0] else os.getcwd()
+
+
+def baseline_file_path(hostname):
+    import os
+    clean = hostname.replace(".", "_") if hostname else "unknown_target"
+    return os.path.join(get_script_dir(), f"baseline_{clean}.json")
+
+
+def load_baseline(hostname):
+    import os
+    path = baseline_file_path(hostname)
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return None
+
+
+def save_baseline(hostname, path_probe_findings, run_at):
+    path = baseline_file_path(hostname)
+    snapshot = {
+        "saved_at": run_at,
+        "entries": {
+            e["path"]: {"status": e.get("status"), "size": e.get("size"), "sha256": e.get("sha256")}
+            for e in path_probe_findings
+            if "path" in e and "error" not in e
+        },
+    }
+    with open(path, "w") as f:
+        json.dump(snapshot, f, indent=2)
+    return path
+
+
+def check_baseline_diff(hostname, results):
+    """
+    Compare this run's path-probe results against a saved baseline from a
+    previous "known good" run.
+
+    A single scan only tells you the site's state right now; a diff tells
+    you whether anything changed since you last checked. For someone worried
+    about an ongoing or past compromise (rather than auditing a brand-new
+    site), that's usually the more actionable signal — a newly-appearing
+    file or changed content is a much stronger indicator than any single
+    static finding.
+    """
+    print("\n[*] Comparing path-probe results against saved baseline")
+    baseline = load_baseline(hostname)
+    current = {e["path"]: e for e in results.get("path_probe", []) if "path" in e and "error" not in e}
+
+    if baseline is None:
+        results["baseline_diff"] = {"note": "No prior baseline found for this host — nothing to diff against yet."}
+        print("    No prior baseline found for this host. Nothing to diff against yet.")
+        print("    You'll be asked at the end of this run whether to save one for next time.")
+        return
+
+    base_entries = baseline.get("entries", {})
+    new_200s, changed, disappeared = [], [], []
+
+    for path, entry in current.items():
+        base = base_entries.get(path)
+        if entry.get("status") == 200:
+            if base is None or base.get("status") != 200:
+                new_200s.append(path)
+            elif entry.get("sha256") and base.get("sha256") and entry["sha256"] != base["sha256"]:
+                changed.append(path)
+
+    for path, base in base_entries.items():
+        if base.get("status") == 200 and current.get(path, {}).get("status") != 200:
+            disappeared.append(path)
+
+    results["baseline_diff"] = {
+        "baseline_saved_at": baseline.get("saved_at"),
+        "new_200_paths": new_200s,
+        "changed_content_paths": changed,
+        "no_longer_200_paths": disappeared,
+    }
+
+    if not (new_200s or changed or disappeared):
+        print(f"    No drift detected since baseline saved at {baseline.get('saved_at')}.")
+    if new_200s:
+        print(f"    [FLAG] {len(new_200s)} path(s) newly returning 200 since baseline: {new_200s}")
+        print("           A file appearing that wasn't there before is worth investigating,")
+        print("           especially if you don't recognize it from a recent deploy.")
+    if changed:
+        print(f"    [FLAG] {len(changed)} path(s) changed content since baseline: {changed}")
+    if disappeared:
+        print(f"    [info] {len(disappeared)} path(s) that were 200 at baseline are no longer 200: {disappeared}")
+        print("           Can be benign (cleanup/redeploy) but worth a glance if unexpected.")
 
 
 def check_error_verbosity(base_url, results):
@@ -675,6 +867,7 @@ def main():
         check_tls(hostname, results)
         check_cors(https_url, results)
         check_common_paths(https_url, results)
+        check_baseline_diff(hostname, results)
         check_error_verbosity(https_url, results)
 
         # --- Pass 2: HTTP (downgrade / plaintext-exposure check only) ---
@@ -700,6 +893,22 @@ def main():
         print("[*] This harness covers infra/config checks only.")
         print("[*] Run manual_test_cases.md for the XSS / prompt-injection / rate-limit checks")
         print("[*] that need a human to actually submit the form and look at the result.")
+
+        # Offer to save/update the baseline used by check_baseline_diff on
+        # future runs. Deliberately requires explicit confirmation rather
+        # than auto-saving, so a baseline is never overwritten with results
+        # you haven't actually reviewed (e.g. right after a compromise).
+        print("\n" + "-" * 40)
+        save_choice = input(
+            "Save this run's path-probe results as the new baseline for future diffs?\n"
+            "(Only do this once you've reviewed the findings above and are confident\n"
+            "this state is legitimate/known-good.) (y/n): "
+        ).strip().lower()
+        if save_choice == "y":
+            baseline_path = save_baseline(hostname, results.get("path_probe", []), results["run_at"])
+            print(f"[*] Baseline saved to: {baseline_path}")
+        else:
+            print("[*] Baseline left unchanged.")
 
     except Exception as e:
         print(f"\n[CRITICAL ERROR] The script crashed: {e}")
