@@ -341,6 +341,160 @@ def check_headers(base_url, results):
         print("    All checked headers present.")
 
 
+def parse_csp(csp_string):
+    """
+    Split a raw Content-Security-Policy header value into a dict of
+    {directive_name: [source_tokens]}. Minimal on purpose — this is a
+    heuristic parser for spotting weak configs, not a spec-complete CSP
+    parser (it doesn't validate nonce/hash syntax, doesn't handle
+    duplicate directives per spec rules, etc).
+    """
+    directives = {}
+    for part in csp_string.split(";"):
+        tokens = part.strip().split()
+        if not tokens:
+            continue
+        name = tokens[0].lower()
+        directives[name] = tokens[1:]
+    return directives
+
+
+def _has_token(values, token):
+    return any(v.strip("'").lower() == token for v in values)
+
+
+def evaluate_csp(directives):
+    """
+    Heuristic checks for the CSP weaknesses that matter most for XSS risk:
+    missing script restriction, unsafe-inline/unsafe-eval, wildcard sources,
+    and a few supporting directives (object-src, base-uri, frame-ancestors).
+    Returns a list of {severity, issue} dicts.
+    """
+    findings = []
+
+    effective_script_src = directives.get("script-src", directives.get("default-src"))
+    if effective_script_src is None:
+        findings.append({
+            "severity": "HIGH",
+            "issue": "No script-src or default-src directive — CSP provides no restriction on where scripts can load from.",
+        })
+    else:
+        if _has_token(effective_script_src, "unsafe-inline"):
+            findings.append({
+                "severity": "HIGH",
+                "issue": "'unsafe-inline' allowed for scripts — inline <script> tags and injected event-handler XSS payloads will execute despite the CSP.",
+            })
+        if _has_token(effective_script_src, "unsafe-eval"):
+            findings.append({
+                "severity": "HIGH",
+                "issue": "'unsafe-eval' allowed — eval()/new Function()-style injection succeeds despite the CSP.",
+            })
+        if any(v == "*" for v in effective_script_src):
+            findings.append({
+                "severity": "HIGH",
+                "issue": "Wildcard '*' allowed as a script source — any origin can serve executable script; this is close to having no CSP at all.",
+            })
+        broad_schemes = [v for v in effective_script_src if v.lower() in ("data:", "http:")]
+        if broad_schemes:
+            findings.append({
+                "severity": "MEDIUM",
+                "issue": f"Overly broad scheme source(s) allowed for scripts: {broad_schemes}. "
+                         "'data:' can smuggle inline-script-equivalent payloads; 'http:' allows unencrypted script loads.",
+            })
+
+    object_src = directives.get("object-src", directives.get("default-src"))
+    if object_src is None or not _has_token(object_src, "none"):
+        findings.append({
+            "severity": "MEDIUM",
+            "issue": "object-src is not restricted to 'none' — plugin-based content (legacy Flash/Java) could still be embedded on older browsers.",
+        })
+
+    if "base-uri" not in directives:
+        findings.append({
+            "severity": "MEDIUM",
+            "issue": "No base-uri directive — an injected <base> tag could hijack all relative URLs on the page.",
+        })
+
+    if "frame-ancestors" not in directives:
+        findings.append({
+            "severity": "LOW",
+            "issue": "No frame-ancestors directive — clickjacking protection then relies solely on X-Frame-Options, if present.",
+        })
+
+    if "default-src" not in directives and "script-src" in directives:
+        findings.append({
+            "severity": "LOW",
+            "issue": "No default-src fallback — any directive not explicitly set (connect-src, font-src, img-src, etc.) is left unrestricted.",
+        })
+
+    return findings
+
+
+def check_csp(results):
+    """
+    Parse and validate the CSP actually in effect, rather than just checking
+    presence (which check_headers already does). Looks in three places, in
+    order of how strongly the browser trusts them: the enforcing header,
+    the report-only header (informational only, not enforced), and a
+    <meta http-equiv="Content-Security-Policy"> tag in the homepage HTML.
+    """
+    print("\n[*] Parsing and validating Content-Security-Policy")
+    headers_result = results.get("headers", {})
+    present = headers_result.get("present_security_headers", {})
+    csp_raw = present.get("content-security-policy")
+    source = "enforcing header"
+
+    if not csp_raw:
+        all_headers = headers_result.get("all_response_headers", {})
+        csp_ro = next((v for k, v in all_headers.items() if k.lower() == "content-security-policy-report-only"), None)
+        if csp_ro:
+            csp_raw = csp_ro
+            source = "Content-Security-Policy-Report-Only header (NOT enforced by the browser — violations are only reported)"
+
+    if not csp_raw:
+        body = results.get("_homepage_body")
+        if body:
+            import re
+            try:
+                text = body.decode("utf-8", errors="ignore")
+            except Exception:
+                text = ""
+            m = re.search(
+                r'<meta[^>]+http-equiv=["\']Content-Security-Policy["\'][^>]+content=["\']([^"\']+)["\']',
+                text, re.IGNORECASE,
+            )
+            if m:
+                csp_raw = m.group(1)
+                source = "<meta> tag in HTML"
+
+    if not csp_raw:
+        results["csp"] = {"present": False, "note": "No CSP found via enforcing header, report-only header, or <meta> tag."}
+        print("    No CSP found anywhere (header, report-only header, or <meta> tag).")
+        return
+
+    directives = parse_csp(csp_raw)
+    findings = evaluate_csp(directives)
+    results["csp"] = {
+        "present": True,
+        "source": source,
+        "raw": csp_raw,
+        "parsed_directives": directives,
+        "findings": findings,
+    }
+
+    print(f"    CSP found via {source}.")
+    if source.startswith("Content-Security-Policy-Report-Only"):
+        print("    [WARN] This policy is report-only — it does NOT block anything, it only logs violations.")
+    if findings:
+        for f in findings:
+            print(f"    [{f['severity']}] {f['issue']}")
+    else:
+        print("    No obvious weaknesses found by this heuristic check (still worth a manual review).")
+    print("    NOTE: this is a heuristic parser, not a full CSP validator. For an authoritative")
+    print("    analysis, run the policy through Google's CSP Evaluator:")
+    print("    https://csp-evaluator.withgoogle.com/")
+
+
 def check_dns(hostname, results):
     """
     Log the currently-resolved IP(s) for the target. Useful as a tamper-evident
@@ -516,6 +670,7 @@ def main():
         # --- Pass 1: HTTPS (canonical, deep scan) ---
         check_dns(hostname, results)
         check_headers(https_url, results)
+        check_csp(results)
         check_cookies(https_url, results)
         check_tls(hostname, results)
         check_cors(https_url, results)
