@@ -46,6 +46,13 @@ CONNECT_TIMEOUT = 6
 READ_TIMEOUT = 10
 REQUEST_TIMEOUT = (CONNECT_TIMEOUT, READ_TIMEOUT)
 
+# Identify this scanner honestly instead of sending the default
+# "python-requests/x.x.x" User-Agent. The default signature is a well-known
+# fingerprint that WAFs/bot-mitigation layers watch for; masquerading as a
+# generic bot makes it more likely you get blocked mid-scan (edge-layer 403s)
+# rather than reaching your own app and seeing its real behavior.
+SCANNER_USER_AGENT = "harness-selfscan/1.1 (self-owned-site security check; see harness.py)"
+
 
 def strip_terminal_escapes(text):
     """
@@ -67,11 +74,15 @@ def safe_get(url, **kwargs):
       - never follows redirects automatically (so hops can be inspected/validated)
       - caps how much of the body is ever buffered into memory
       - uses separate connect/read timeouts
+      - identifies itself with an honest User-Agent (see SCANNER_USER_AGENT)
     """
     kwargs.pop("allow_redirects", None)
     kwargs.setdefault("timeout", REQUEST_TIMEOUT)
     kwargs["allow_redirects"] = False
     kwargs["stream"] = True
+    headers = dict(kwargs.get("headers") or {})
+    headers.setdefault("User-Agent", SCANNER_USER_AGENT)
+    kwargs["headers"] = headers
     r = requests.get(url, **kwargs)
     content = b""
     for chunk in r.iter_content(chunk_size=8192):
@@ -651,11 +662,63 @@ def check_cors(base_url, results):
         print(f"    ERROR: {e}")
 
 
+def detect_waf_block(response):
+    """
+    Heuristically distinguish an edge-layer block (WAF / bot-mitigation /
+    platform deployment-protection) from a genuine application-level
+    response. This matters because a 403 from a WAF means the request never
+    reached your app at all — it's a very different finding than an app
+    returning its own 403/405/etc, and conflating the two can make scan
+    results look "unstable" when what's actually happening is a defense
+    layer engaging partway through a scan.
+
+    Returns {"likely_waf_block": bool, "indicators": [...]} — indicators are
+    the specific header/body signals that triggered the heuristic, not a
+    guarantee. This is best-effort pattern matching, not certainty.
+    """
+    indicators = []
+    headers = {k.lower(): v for k, v in getattr(response, "headers", {}).items()}
+
+    header_signatures = {
+        "cf-ray": "Cloudflare (cf-ray header present)",
+        "cf-mitigated": "Cloudflare bot-mitigation header present",
+        "x-sucuri-id": "Sucuri WAF header present",
+        "x-iinfo": "Incapsula/Imperva header present",
+        "x-akamai-transformed": "Akamai edge header present",
+        "x-cdn": "Generic CDN/edge header present",
+    }
+    for h, desc in header_signatures.items():
+        if h in headers:
+            indicators.append(desc)
+    server_val = headers.get("server", "").lower()
+    for name in ("cloudflare", "sucuri", "imperva", "incapsula", "akamai"):
+        if name in server_val:
+            indicators.append(f"Server header mentions {name}")
+
+    body_signatures = [
+        "attention required! | cloudflare",
+        "checking your browser before accessing",
+        "please enable javascript and cookies",
+        "access denied",
+        "request blocked",
+        "automated access to this website",
+    ]
+    try:
+        body_lower = (response.content or b"")[:4096].decode("utf-8", errors="ignore").lower()
+    except Exception:
+        body_lower = ""
+    for sig in body_signatures:
+        if sig in body_lower:
+            indicators.append(f"Response body matches challenge/block page pattern: '{sig}'")
+
+    return {"likely_waf_block": bool(indicators), "indicators": indicators}
+
+
 def check_common_paths(base_url, results):
     print(f"\n[*] Probing common paths for exposure/misconfig")
     import hashlib
     findings = []
-    for path in COMMON_PATHS:
+    for i, path in enumerate(COMMON_PATHS):
         url = urljoin(base_url, path)
         try:
             r = safe_get(url)
@@ -667,6 +730,18 @@ def check_common_paths(base_url, results):
                 # baseline and flag drift (new/changed public files over time),
                 # not just point-in-time findings.
                 entry["sha256"] = hashlib.sha256(r.content).hexdigest()
+
+            if status in (403, 429):
+                # Distinguish "your app said no" from "something in front of
+                # your app blocked this before it arrived" — conflating the
+                # two makes results look unstable across scans when it's
+                # really an edge-layer defense engaging.
+                waf_check = detect_waf_block(r)
+                entry["possible_waf_or_bot_mitigation"] = waf_check
+                if waf_check["likely_waf_block"]:
+                    print(f"    [WAF?] {path} -> {status} — looks like an edge-layer block, not your app:")
+                    for ind in waf_check["indicators"]:
+                        print(f"           - {ind}")
 
             if status == 200 and path in WEBSHELL_PATHS and size > 0:
                 entry["SEVERITY"] = "CRITICAL — this filename matches common webshell/backdoor naming conventions"
@@ -686,7 +761,16 @@ def check_common_paths(base_url, results):
             findings.append(entry)
         except (requests.RequestException, ValueError) as e:
             findings.append({"path": path, "error": strip_terminal_escapes(str(e))})
-        time.sleep(0.2)  # be gentle, don't hammer your own host
+
+        # Base spacing, same as before. Every 15 requests, add a longer pause
+        # too — a flat 0.2s gap across a much longer path list (65 vs the
+        # original 16) fires enough requests in a short burst to plausibly
+        # trip rate-limiting/bot-mitigation partway through a scan. Breaking
+        # the burst up periodically makes that less likely without slowing
+        # a full scan down dramatically.
+        time.sleep(0.2)
+        if (i + 1) % 15 == 0:
+            time.sleep(1.5)
     results["path_probe"] = findings
 
 
@@ -796,16 +880,25 @@ def check_error_verbosity(base_url, results):
             json={"malformed": True},
             timeout=REQUEST_TIMEOUT,
             allow_redirects=False,  # don't silently POST to wherever a redirect points
+            headers={"User-Agent": SCANNER_USER_AGENT},
         )
         # Cap how much of the body we scan/store, same rationale as safe_get.
         body = r.text[:MAX_RESPONSE_BYTES]
         leaks_stack = any(kw in body.lower() for kw in ["traceback", "at node:", "stack:", "internal server error", "prisma", "env.", "api_key"])
-        tests.append({
+        test_entry = {
             "endpoint_guessed": api_guess,
             "status": r.status_code,
             "possible_leak_markers_found": leaks_stack,
             "note": "This guesses a likely API route name; if your real route differs, edit COMMON_PATHS / this function.",
-        })
+        }
+        if r.status_code in (403, 429):
+            waf_check = detect_waf_block(r)
+            test_entry["possible_waf_or_bot_mitigation"] = waf_check
+            if waf_check["likely_waf_block"]:
+                print(f"    [WAF?] {api_guess} -> {r.status_code} — looks like an edge-layer block, not your app:")
+                for ind in waf_check["indicators"]:
+                    print(f"           - {ind}")
+        tests.append(test_entry)
         if leaks_stack:
             print(f"    [WARN] Response body may contain internal details — review manually: {api_guess}")
             print("           Review the saved JSON report in a text editor, not a browser.")
